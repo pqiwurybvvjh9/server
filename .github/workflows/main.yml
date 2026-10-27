@@ -1,7 +1,85 @@
-- name: Inspect CPU capabilities
-  run: |
-    lscpu
-    echo "=== CPU flags ==="
-    grep -m1 '^flags' /proc/cpuinfo
-    echo "=== Memory ==="
-    free -h
+
+name: CPU FP16-BF16 Inspection
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: CPU model and hardware information
+        run: |
+          echo "===== CPU MODEL ====="
+          lscpu
+
+          echo ""
+          echo "===== CPU FLAGS ====="
+          grep -m1 '^flags' /proc/cpuinfo || true
+
+          echo ""
+          echo "===== MEMORY ====="
+          free -h
+
+          echo ""
+          echo "===== OS ====="
+          uname -a
+
+      - name: Check FP16 and BF16 instruction support
+        run: |
+          FLAGS=$(grep -m1 '^flags' /proc/cpuinfo || true)
+
+          echo "===== FP16 / BF16 SUPPORT ====="
+
+          for flag in \
+            f16c avx512_fp16 avx512_bf16 \
+            amx_bf16 avx512f avx2 \
+            neon sve sve2
+          do
+            if echo "$FLAGS" | grep -qw "$flag"; then
+              echo "$flag: SUPPORTED"
+            else
+              echo "$flag: not detected"
+            fi
+          done
+
+          echo ""
+          echo "Note: CPU flags indicate instruction support,"
+          echo "not guaranteed peak FLOPS."
+
+      - name: Compiler and CPU feature inspection
+        run: |
+          echo "===== COMPILER ====="
+          gcc --version | head -n 1
+
+          echo ""
+          echo "===== COMPILER CPU FEATURES ====="
+          gcc -march=native -Q --help=target 2>/dev/null \
+            | grep -E 'mavx|mfma|mavx512|mavx2|mf16c' \
+            || true
+
+      - name: Check Python numerical libraries
+        run: |
+          python3 -m pip install --quiet numpy
+
+          python3 - <<'PY'
+          import platform
+          import numpy as np
+
+          print("Python:", platform.python_version())
+          print("Architecture:", platform.machine())
+          print("NumPy:", np.__version__)
+          print("NumPy CPU features:")
+          try:
+              from numpy._core._multiarray_umath import __cpu_features__
+              for key, value in sorted(__cpu_features__.items()):
+                  if any(x in key for x in ("AVX", "F16", "BF16", "AMX", "NEON", "SVE")):
+                      print(f"  {key}: {value}")
+          except Exception as e:
+              print("Feature inspection unavailable:", e)
+          PY
