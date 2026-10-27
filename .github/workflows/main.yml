@@ -1,0 +1,886 @@
+# =====================================================================================
+#  Gemma 4 E4B on a GitHub runner  ->  open API + open MCP server, 6 hours per run
+#
+#  * API  : OpenAI + Anthropic + Ollama compatible, no key. A custom instruction is added to
+#           every request and the model's thinking is passed through (reasoning /
+#           reasoning_content, "thinking" blocks, message.thinking).
+#  * MCP  : Streamable-HTTP MCP server, no authentication, for ChatGPT / Claude connectors.
+#  * Each one gets its own Cloudflare quick tunnel (no account). The two links are printed in
+#    the job log (repeated every 10 min), in the run summary and as annotations.
+#
+#  Use it: save as .github/workflows/gemma.yml in a PUBLIC repo (public runners have 16 GB RAM,
+#  private ones are too small), then Actions -> "Gemma 4 E4B ..." -> Run workflow.
+#  The links change on every run, and anyone who sees them can use them.
+# =====================================================================================
+name: Gemma 4 E4B server (API + MCP)
+
+on:
+  workflow_dispatch:
+    inputs:
+      instruction:
+        description: "Custom instruction for Gemma (empty = DEFAULT_INSTRUCTION below)"
+        type: string
+        required: false
+        default: ""
+      model:
+        description: "Ollama model tag"
+        type: string
+        required: false
+        default: "gemma4:e4b"
+  # To start a fresh 6 h session automatically, remove the # from the next two lines:
+  # schedule:
+  #   - cron: "10 */6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gemma-server
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  MODEL: ${{ inputs.model || 'gemma4:e4b' }}
+  INSTRUCTION_OVERRIDE: ${{ inputs.instruction }}
+  RUN_MINUTES: "355"     # stay online this long; GitHub stops every job at 360 min
+  NUM_CTX: "8192"        # context window in tokens (prompt + thinking + answer)
+  API_PORT: "8000"
+  MCP_PORT: "8001"
+  # >>> EDIT ME: the custom instruction Gemma receives on every request (API and MCP) <<<
+  DEFAULT_INSTRUCTION: |
+    You are Gemma, a helpful, honest and concise assistant running on a self-hosted server.
+    - Think the problem through before you answer, and check maths and logic step by step.
+    - Give the answer first, then only the explanation that is needed.
+    - If you are not sure, or information is missing, say so instead of guessing.
+    - When asked for code, return complete, runnable code in a fenced block with the language tagged.
+    - Reply in the language the user writes in.
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Prepare
+        run: |
+          mkdir -p /tmp/gemma
+          date +%s > /tmp/gemma/start_epoch
+          mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+          echo "Runner: $(nproc) vCPU, ${mem_mb} MB RAM"
+          if [ "$mem_mb" -lt 12000 ]; then
+            echo "::warning title=Not enough RAM::This runner has only ${mem_mb} MB. Gemma 4 E4B needs about 12 GB, so run this in a PUBLIC repository (its runners have 16 GB)."
+          fi
+          # the custom instruction: the text typed into "Run workflow" if any, else DEFAULT_INSTRUCTION
+          if [ -n "${INSTRUCTION_OVERRIDE//[[:space:]]/}" ]; then
+            printf '%s\n' "$INSTRUCTION_OVERRIDE" > /tmp/gemma/instruction.txt
+          else
+            printf '%s\n' "$DEFAULT_INSTRUCTION" > /tmp/gemma/instruction.txt
+          fi
+          # make room for the ~10 GB model: remove toolchains this job never uses (in the background)
+          df -h / | tail -n 1
+          (sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL > /dev/null 2>&1 &)
+
+      - name: Write the gateway (API + MCP) and helper functions
+        run: |
+          cat > /tmp/gemma/gateway.py <<'GATEWAY_PY'
+          #!/usr/bin/env python3
+          """Gemma gateway - one process, two servers.
+
+            API_PORT  OpenAI + Anthropic + Ollama compatible API (open, no key).
+                      Every request gets the custom instruction; the model's thinking is passed through.
+            MCP_PORT  MCP server (Streamable HTTP, plain JSON replies, open, no auth) whose tools call the same model.
+
+          Both sides talk to the Ollama server running on this machine.
+          """
+          import asyncio
+          import html
+          import json
+          import os
+          import time
+
+          from aiohttp import ClientSession, ClientTimeout, web
+
+          UP = os.environ.get("UPSTREAM", "http://127.0.0.1:11434").rstrip("/")
+          MODEL = os.environ["MODEL"]
+          API_PORT = int(os.environ.get("API_PORT", "8000"))
+          MCP_PORT = int(os.environ.get("MCP_PORT", "8001"))
+          EARLY = float(os.environ.get("EARLY_SECONDS", "15"))  # slower than this: send headers now, keep the line warm
+          PING = float(os.environ.get("PING_SECONDS", "10"))
+          with open(os.environ.get("INSTRUCTION_FILE", "/tmp/gemma/instruction.txt"), encoding="utf-8") as fh:
+              INSTRUCTION = fh.read().strip()
+
+          STARTED = time.time()
+          STATS = {"requests": 0, "mcp_calls": 0}
+          CAPS = []     # what Ollama says the model can do: "thinking", "tools", "vision", ...
+          SESS = None   # shared aiohttp client session
+
+          CORS = {
+              "Access-Control-Allow-Origin": "*",
+              "Access-Control-Allow-Headers": "*",
+              "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+              "Access-Control-Expose-Headers": "*",
+              "Cache-Control": "no-cache, no-transform",
+              "X-Accel-Buffering": "no",
+          }
+          KINDS = {  # kind -> (content type, keep-alive bytes that are invisible to that kind of client)
+              "sse": ("text/event-stream", b": keep-alive\n\n"),
+              "ndjson": ("application/x-ndjson", b"\n"),
+              "json": ("application/json", b" "),
+          }
+
+
+          # ----------------------------------------------------------------------------- helpers
+          def jresp(data, status=200):
+              return web.json_response(data, status=status, headers=CORS)
+
+
+          def err(message, status=400, kind="invalid_request_error"):
+              # one shape that OpenAI and Anthropic SDKs can both read
+              return jresp({"type": "error", "error": {"type": kind, "message": message}}, status)
+
+
+          def flat(content):
+              """OpenAI/Anthropic content (string or list of text parts) -> plain string."""
+              if content is None:
+                  return ""
+              if isinstance(content, str):
+                  return content
+              if isinstance(content, list):
+                  return "\n".join(p.get("text", "") for p in content if isinstance(p, dict) and isinstance(p.get("text"), str))
+              return str(content)
+
+
+          def merged(extra):
+              """The custom instruction, followed by whatever system prompt the client sent."""
+              extra = flat(extra).strip()
+              if not extra:
+                  return INSTRUCTION
+              return INSTRUCTION + "\n\n---\nExtra instructions from the calling application:\n" + extra
+
+
+          def chat_messages(msgs):
+              msgs = [m for m in (msgs or []) if isinstance(m, dict)]
+              lead, i = [], 0
+              while i < len(msgs) and msgs[i].get("role") in ("system", "developer"):
+                  lead.append(flat(msgs[i].get("content")))
+                  i += 1
+              rest = [dict(m, role="system") if m.get("role") == "developer" else m for m in msgs[i:]]
+              return [{"role": "system", "content": merged("\n\n".join(x for x in lead if x))}] + rest
+
+
+          # one fixer per endpoint: force our model + inject the instruction
+          def fix_openai(p):
+              p["model"] = MODEL
+              p["messages"] = chat_messages(p.get("messages"))
+
+
+          def fix_anthropic(p):
+              p["model"] = MODEL
+              p["system"] = merged(p.get("system"))
+
+
+          # The API is open, so callers may tune sampling but must not reconfigure the shared model server
+          # (no num_ctx / thread / GPU options, no keep_alive, no verbose dumps).
+          SAFE_OPTIONS = {"temperature", "top_p", "top_k", "min_p", "num_predict", "seed", "stop", "repeat_penalty",
+                          "repeat_last_n", "presence_penalty", "frequency_penalty", "typical_p", "penalize_newline",
+                          "mirostat", "mirostat_tau", "mirostat_eta"}
+
+
+          def tame(p):
+              p.pop("keep_alive", None)
+              p.pop("verbose", None)
+              if isinstance(p.get("options"), dict):
+                  p["options"] = {k: v for k, v in p["options"].items() if k in SAFE_OPTIONS}
+
+
+          def fix_ollama_chat(p):
+              tame(p)
+              p["model"] = MODEL
+              p["messages"] = chat_messages(p.get("messages"))
+
+
+          def fix_ollama_generate(p):
+              tame(p)
+              p["model"] = MODEL
+              if not p.get("raw"):
+                  p["system"] = merged(p.get("system"))
+
+
+          def fix_responses(p):
+              p["model"] = MODEL
+              p["instructions"] = merged(p.get("instructions"))
+
+
+          def fix_completions(p):
+              p["model"] = MODEL
+              if isinstance(p.get("prompt"), str):
+                  p["prompt"] = INSTRUCTION + "\n\n" + p["prompt"]
+
+
+          def fix_show(p):
+              tame(p)
+              p["model"] = MODEL
+              p.pop("name", None)
+
+
+          def sse_or_json(p):
+              return "sse" if p.get("stream") else "json"
+
+
+          def ndjson_or_json(p):  # Ollama's own API streams unless told not to
+              return "json" if p.get("stream") is False else "ndjson"
+
+
+          def always_json(p):
+              return "json"
+
+
+          # Ollama puts the thinking in "reasoning"; many OpenAI clients look for "reasoning_content". Offer both.
+          def mirror_obj(o):
+              changed = False
+              for ch in (o.get("choices") or []) if isinstance(o, dict) else []:
+                  for key in ("message", "delta"):
+                      m = ch.get(key) if isinstance(ch, dict) else None
+                      if isinstance(m, dict):
+                          if m.get("reasoning") and not m.get("reasoning_content"):
+                              m["reasoning_content"] = m["reasoning"]
+                              changed = True
+                          elif m.get("reasoning_content") and not m.get("reasoning"):
+                              m["reasoning"] = m["reasoning_content"]
+                              changed = True
+              return changed
+
+
+          def mirror_body(raw):
+              try:
+                  obj = json.loads(raw)
+              except Exception:
+                  return raw
+              return json.dumps(obj, ensure_ascii=False).encode() if mirror_obj(obj) else raw
+
+
+          def mirror_line(line):
+              if not line.startswith(b"data:"):
+                  return line
+              data = line[5:].strip()
+              if not data or data == b"[DONE]":
+                  return line
+              try:
+                  obj = json.loads(data)
+              except Exception:
+                  return line
+              return b"data: " + json.dumps(obj, ensure_ascii=False).encode() if mirror_obj(obj) else line
+
+
+          # ----------------------------------------------------------------------------- relay to Ollama
+          async def up_request(method, path, payload):
+              if payload is None:
+                  return await SESS.request(method, UP + path)
+              return await SESS.request(method, UP + path, json=payload)
+
+
+          async def relay(request, method, path, payload, kind, mirror=False):
+              """Forward to Ollama and stream the answer back.
+
+              Quick tunnels drop a request after ~100 s without a byte. CPU inference can be slower than that, so when
+              Ollama hasn't answered after EARLY seconds we send the headers ourselves and keep the line warm with bytes
+              every client ignores (a space for JSON, a comment line for SSE, an empty line for NDJSON).
+              """
+              STATS["requests"] += 1
+              ctype, ping = KINDS[kind]
+              fut = asyncio.ensure_future(up_request(method, path, payload))
+              out = up = None
+              try:
+                  await asyncio.wait({fut}, timeout=EARLY)
+                  if not fut.done():
+                      out = web.StreamResponse(status=200, headers={**CORS, "Content-Type": ctype})
+                      await out.prepare(request)
+                      while not fut.done():
+                          await out.write(ping)
+                          await asyncio.wait({fut}, timeout=PING)
+                  try:
+                      up = fut.result()
+                  except Exception as exc:
+                      msg = f"Ollama backend error: {exc}"
+                      if out is None:
+                          return err(msg, 502, "api_error")
+                      await out.write(json.dumps({"type": "error", "error": {"type": "api_error", "message": msg}}).encode())
+                      await out.write_eof()
+                      return out
+                  if out is None:
+                      out = web.StreamResponse(
+                          status=up.status, headers={**CORS, "Content-Type": up.headers.get("Content-Type", ctype)})
+                      await out.prepare(request)
+                  if mirror and kind == "json":
+                      await out.write(mirror_body(await up.read()))
+                  elif mirror and kind == "sse":
+                      buf = b""
+                      async for chunk in up.content.iter_any():
+                          buf += chunk
+                          *lines, buf = buf.split(b"\n")
+                          for line in lines:
+                              await out.write(mirror_line(line) + b"\n")
+                      if buf:
+                          await out.write(mirror_line(buf))
+                  else:
+                      async for chunk in up.content.iter_any():
+                          await out.write(chunk)
+                  await out.write_eof()
+                  return out
+              except ConnectionResetError:
+                  return out if out is not None else web.Response(status=499)
+              finally:
+                  if not fut.done():
+                      fut.cancel()  # client left: dropping the upstream connection makes Ollama stop generating
+                  if up is not None:
+                      up.close()
+
+
+          def post_route(path, fix, kind_of, mirror=False):
+              async def handler(request):
+                  try:
+                      payload = await request.json()
+                      if not isinstance(payload, dict):
+                          raise ValueError
+                  except Exception:
+                      return err("The request body must be a JSON object.")
+                  fix(payload)
+                  return await relay(request, "POST", path, payload, kind_of(payload), mirror)
+
+              return handler
+
+
+          def get_route(path):
+              async def handler(request):
+                  return await relay(request, "GET", path, None, "json")
+
+              return handler
+
+
+          # ----------------------------------------------------------------------------- API app
+          def base_url(request):
+              host = request.headers.get("X-Forwarded-Host") or request.host
+              proto = request.headers.get("X-Forwarded-Proto") or ("https" if host.endswith(".trycloudflare.com") else "http")
+              return f"{proto}://{host}"
+
+
+          API_PAGE = r"""<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>__MODEL__</title>
+          <body style="font:15px/1.5 system-ui,sans-serif;max-width:780px;margin:2rem auto;padding:0 1rem">
+          <h2>__MODEL__ is running</h2>
+          <p>Open API, no key needed (any key string is accepted). Thinking: <b>__THINK__</b>.
+          A custom instruction is added to every request.</p>
+          <pre style="white-space:pre-wrap;background:#8882;padding:1rem;border-radius:8px">
+          OpenAI     base_url  __BASE__/v1   POST /v1/chat/completions, /v1/responses   thinking: message.reasoning
+          Anthropic  base_url  __BASE__      POST /v1/messages                          thinking: content block "thinking"
+          Ollama     host      __BASE__      POST /api/chat, /api/generate              thinking: message.thinking
+
+          curl __BASE__/v1/chat/completions -H 'Content-Type: application/json' \
+            -d '{"model":"__MODEL__","messages":[{"role":"user","content":"Why is the sky blue?"}]}'
+          </pre>
+          <p>Tip: through a quick tunnel, streaming (SSE) may arrive all at once. Non-streaming calls are the safest.</p>
+          </body>"""
+
+
+          async def api_landing(request):
+              page = (API_PAGE.replace("__MODEL__", html.escape(MODEL)).replace("__BASE__", html.escape(base_url(request)))
+                      .replace("__THINK__", "on" if "thinking" in CAPS else "not offered by this model"))
+              return web.Response(text=page, content_type="text/html", headers=CORS)
+
+
+          async def health(request):
+              return jresp({"ok": True, "model": MODEL, "thinking": "thinking" in CAPS,
+                            "uptime_s": int(time.time() - STARTED), **STATS})
+
+
+          def model_obj():
+              return {"id": MODEL, "object": "model", "type": "model", "display_name": MODEL, "owned_by": "local",
+                      "created": int(STARTED), "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(STARTED))}
+
+
+          async def models(request):  # shaped for both OpenAI and Anthropic clients
+              return jresp({"object": "list", "data": [model_obj()], "has_more": False, "first_id": MODEL, "last_id": MODEL})
+
+
+          async def model_one(request):
+              return jresp(model_obj())
+
+
+          async def count_tokens(request):  # Ollama has no token counter: rough estimate
+              try:
+                  p = await request.json()
+              except Exception:
+                  return err("The request body must be JSON.")
+              text = json.dumps([p.get("system", ""), p.get("messages", []), p.get("tools", [])], ensure_ascii=False)
+              return jresp({"input_tokens": max(1, (len(text) + len(INSTRUCTION)) // 3)})
+
+
+          async def preflight(request):  # browsers: echo back exactly the headers they ask for (a bare * skips Authorization)
+              return web.Response(status=204, headers={
+                  **CORS, "Access-Control-Allow-Headers": request.headers.get("Access-Control-Request-Headers", "*"),
+                  "Access-Control-Max-Age": "86400"})
+
+
+          async def not_found(request):
+              return err(f"Not found: {request.method} {request.path}", 404, "not_found_error")
+
+
+          @web.middleware
+          async def access_log(request, handler):
+              t0, status = time.time(), 500
+              try:
+                  resp = await handler(request)
+                  status = resp.status
+                  return resp
+              except web.HTTPException as exc:
+                  status = exc.status
+                  raise
+              except asyncio.CancelledError:
+                  status = "client-closed"
+                  raise
+              finally:
+                  if request.method != "OPTIONS":
+                      print(f"{request.method} {request.path} {status} {int((time.time() - t0) * 1000)}ms", flush=True)
+
+
+          def make_api():
+              app = web.Application(middlewares=[access_log], client_max_size=64 * 1024 * 1024)
+              r = app.router
+              r.add_get("/", api_landing)
+              r.add_get("/healthz", health)
+              r.add_get("/v1/models", models)
+              r.add_get("/v1/models/{name:.+}", model_one)
+              for path in ("/api/tags", "/api/version", "/api/ps"):
+                  r.add_get(path, get_route(path))
+              r.add_post("/v1/chat/completions", post_route("/v1/chat/completions", fix_openai, sse_or_json, mirror=True))
+              r.add_post("/v1/completions", post_route("/v1/completions", fix_completions, sse_or_json))
+              r.add_post("/v1/responses", post_route("/v1/responses", fix_responses, sse_or_json))
+              r.add_post("/v1/messages", post_route("/v1/messages", fix_anthropic, sse_or_json))
+              r.add_post("/v1/messages/count_tokens", count_tokens)
+              r.add_post("/api/chat", post_route("/api/chat", fix_ollama_chat, ndjson_or_json))
+              r.add_post("/api/generate", post_route("/api/generate", fix_ollama_generate, ndjson_or_json))
+              r.add_post("/api/show", post_route("/api/show", fix_show, always_json))
+              r.add_route("OPTIONS", "/{tail:.*}", preflight)
+              r.add_route("*", "/{tail:.*}", not_found)  # pull / create / delete / copy ... are NOT exposed
+              return app
+
+
+          # ----------------------------------------------------------------------------- MCP app
+          MCP_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
+          READ_ONLY = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}
+          KNOBS = {
+              "thinking": {"type": "boolean", "description": "Return Gemma's reasoning together with the answer (default true). "
+                                                             "false = faster and shorter."},
+              "max_tokens": {"type": "integer", "description": "Most tokens Gemma may write, thinking included "
+                                                               "(default 2048). It runs on a CPU: only a few tokens per second."},
+              "temperature": {"type": "number", "description": "Sampling temperature (default: the model's own)."},
+          }
+          TOOLS = [
+              {"name": "ask_gemma", "title": "Ask Gemma",
+               "description": "Ask the self-hosted Gemma model one question. Returns its answer and, by default, the thinking "
+                              "behind it. A custom instruction is always applied.",
+               "inputSchema": {"type": "object", "required": ["prompt"], "properties": {
+                   "prompt": {"type": "string", "description": "The question or task for Gemma."},
+                   "system": {"type": "string", "description": "Optional extra instruction for this call only."}, **KNOBS}},
+               "annotations": {"title": "Ask Gemma", **READ_ONLY}},
+              {"name": "chat_gemma", "title": "Chat with Gemma",
+               "description": "Multi-turn chat with the self-hosted Gemma model: send the whole conversation so far. "
+                              "Returns its answer and, by default, its thinking.",
+               "inputSchema": {"type": "object", "required": ["messages"], "properties": {
+                   "messages": {"type": "array", "description": "Conversation, oldest first.", "items": {
+                       "type": "object", "required": ["role", "content"], "properties": {
+                           "role": {"type": "string", "enum": ["system", "user", "assistant"]},
+                           "content": {"type": "string"}}}}, **KNOBS}},
+               "annotations": {"title": "Chat with Gemma", **READ_ONLY}},
+              {"name": "gemma_info", "title": "Gemma status",
+               "description": "Which model is running, what it supports, and the custom instruction it always receives.",
+               "inputSchema": {"type": "object", "properties": {}},
+               "annotations": {"title": "Gemma status", **READ_ONLY}},
+          ]
+
+
+          class RpcError(Exception):
+              def __init__(self, code, message):
+                  super().__init__(message)
+                  self.code = code
+
+
+          def text_result(text, is_error=False):
+              return {"content": [{"type": "text", "text": text}], "isError": is_error}
+
+
+          def render(data, show_thinking):
+              msg = data.get("message") or {}
+              answer = (msg.get("content") or "").strip()
+              thought = (msg.get("thinking") or "").strip()
+              out = answer or "(Gemma wrote no final answer - it probably spent all max_tokens thinking. " \
+                              "Try a bigger max_tokens or thinking=false.)"
+              if answer and data.get("done_reason") == "length":
+                  out += "\n\n[cut off at max_tokens]"
+              if show_thinking and thought:
+                  out += "\n\n--- Gemma's thinking ---\n" + thought
+              return out
+
+
+          async def call_tool(name, args):
+              STATS["mcp_calls"] += 1
+              if not isinstance(args, dict):
+                  args = {}
+              if name == "gemma_info":
+                  return text_result(json.dumps({
+                      "model": MODEL, "capabilities": CAPS, "thinking_supported": "thinking" in CAPS,
+                      "uptime_minutes": int((time.time() - STARTED) / 60), "custom_instruction": INSTRUCTION}, indent=2))
+              if name == "ask_gemma":
+                  prompt = args.get("prompt")
+                  if not isinstance(prompt, str) or not prompt.strip():
+                      return text_result("Error: 'prompt' (a string) is required.", True)
+                  msgs = []
+                  if isinstance(args.get("system"), str) and args["system"].strip():
+                      msgs.append({"role": "system", "content": args["system"]})
+                  msgs.append({"role": "user", "content": prompt})
+              elif name == "chat_gemma":
+                  raw = args.get("messages")
+                  if not isinstance(raw, list) or not raw:
+                      return text_result("Error: 'messages' must be a non-empty list of {role, content}.", True)
+                  msgs = []
+                  for m in raw:
+                      if not (isinstance(m, dict) and m.get("role") in ("system", "user", "assistant")
+                              and isinstance(m.get("content"), str)):
+                          return text_result("Error: each message needs role (system|user|assistant) and string content.", True)
+                      msgs.append({"role": m["role"], "content": m["content"]})
+              else:
+                  raise RpcError(-32602, f"Unknown tool: {name}")
+              think = args.get("thinking", True) is not False
+              try:
+                  num_predict = max(16, min(8192, int(args.get("max_tokens", 2048))))
+              except (TypeError, ValueError):
+                  num_predict = 2048
+              opts = {"num_predict": num_predict}
+              if isinstance(args.get("temperature"), (int, float)) and not isinstance(args.get("temperature"), bool):
+                  opts["temperature"] = float(args["temperature"])
+              body = {"model": MODEL, "messages": chat_messages(msgs), "stream": False, "options": opts}
+              if "thinking" in CAPS:
+                  body["think"] = think
+              try:
+                  async with SESS.post(UP + "/api/chat", json=body) as r:
+                      data = await r.json(content_type=None)
+                      if r.status != 200:
+                          detail = data.get("error", data) if isinstance(data, dict) else data
+                          return text_result(f"Error from Ollama: {detail}", True)
+              except Exception as exc:
+                  return text_result(f"Error: could not reach the model backend ({exc}).", True)
+              return text_result(render(data, think))
+
+
+          async def rpc(m):
+              mid, method = m.get("id"), m.get("method")
+              p = m.get("params") if isinstance(m.get("params"), dict) else {}
+              try:
+                  if method == "initialize":
+                      want = p.get("protocolVersion")
+                      res = {"protocolVersion": want if want in MCP_VERSIONS else MCP_VERSIONS[0],
+                             "capabilities": {"tools": {"listChanged": False}},
+                             "serverInfo": {"name": "gemma-mcp", "title": "Gemma (self-hosted)", "version": "1.0.0"},
+                             "instructions": "Use ask_gemma or chat_gemma to query a self-hosted Gemma model. "
+                                             "Replies include the model's visible thinking."}
+                  elif method == "ping" or method == "logging/setLevel":
+                      res = {}
+                  elif method == "tools/list":
+                      res = {"tools": TOOLS}
+                  elif method == "tools/call":
+                      res = await call_tool(p.get("name"), p.get("arguments"))
+                  elif method == "resources/list":
+                      res = {"resources": []}
+                  elif method == "resources/templates/list":
+                      res = {"resourceTemplates": []}
+                  elif method == "prompts/list":
+                      res = {"prompts": []}
+                  else:
+                      raise RpcError(-32601, f"Method not found: {method}")
+                  return {"jsonrpc": "2.0", "id": mid, "result": res}
+              except RpcError as exc:
+                  return {"jsonrpc": "2.0", "id": mid, "error": {"code": exc.code, "message": str(exc)}}
+              except Exception as exc:  # never let a bug kill the connection
+                  return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": f"Internal error: {exc}"}}
+
+
+          async def mcp_post(request):
+              try:
+                  msg = await request.json()
+              except Exception:
+                  return jresp({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}, 400)
+              batch = isinstance(msg, list)
+              calls = [m for m in (msg if batch else [msg]) if isinstance(m, dict) and m.get("method") and "id" in m]
+              if not calls:  # notifications and client responses need no reply
+                  return web.Response(status=202, headers=CORS)
+              task = asyncio.ensure_future(asyncio.gather(*(rpc(m) for m in calls)))
+
+              def pack(results):
+                  return list(results) if batch else results[0]
+
+              out = None
+              try:
+                  await asyncio.wait({task}, timeout=EARLY)
+                  if task.done():
+                      return jresp(pack(task.result()))
+                  out = web.StreamResponse(status=200, headers={**CORS, "Content-Type": "application/json"})
+                  await out.prepare(request)  # slow tool call: same keep-alive trick as the API
+                  while not task.done():
+                      await out.write(b" ")
+                      await asyncio.wait({task}, timeout=PING)
+                  await out.write(json.dumps(pack(task.result()), ensure_ascii=False).encode())
+                  await out.write_eof()
+                  return out
+              except ConnectionResetError:
+                  return out if out is not None else web.Response(status=499)
+              finally:
+                  if not task.done():
+                      task.cancel()
+
+
+          async def mcp_get(request):  # no server->client stream offered
+              return web.Response(status=405, headers={**CORS, "Allow": "POST, OPTIONS"})
+
+
+          MCP_PAGE = r"""<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>Gemma MCP</title>
+          <body style="font:15px/1.5 system-ui,sans-serif;max-width:780px;margin:2rem auto;padding:0 1rem">
+          <h2>Gemma MCP server</h2>
+          <p>Open, no authentication. Transport: Streamable HTTP. Connector URL:</p>
+          <pre style="background:#8882;padding:1rem;border-radius:8px">__BASE__/mcp</pre>
+          <p>Tools: <code>ask_gemma</code>, <code>chat_gemma</code>, <code>gemma_info</code>. Replies include Gemma's thinking.</p>
+          </body>"""
+
+
+          async def mcp_landing(request):
+              return web.Response(text=MCP_PAGE.replace("__BASE__", html.escape(base_url(request))),
+                                  content_type="text/html", headers=CORS)
+
+
+          def make_mcp():
+              app = web.Application(middlewares=[access_log], client_max_size=64 * 1024 * 1024)
+              r = app.router
+              r.add_get("/", mcp_landing)
+              r.add_get("/healthz", health)
+              for path in ("/", "/mcp"):
+                  r.add_post(path, mcp_post)
+              r.add_route("GET", "/mcp", mcp_get)
+              r.add_route("DELETE", "/mcp", mcp_get)
+              r.add_route("OPTIONS", "/{tail:.*}", preflight)
+              r.add_route("*", "/{tail:.*}", not_found)  # includes /.well-known/*: no OAuth here
+              return app
+
+
+          # ----------------------------------------------------------------------------- main
+          async def probe():
+              for _ in range(45):
+                  try:
+                      async with SESS.post(UP + "/api/show", json={"model": MODEL}) as r:
+                          if r.status == 200:
+                              CAPS[:] = (await r.json(content_type=None)).get("capabilities") or []
+                              return
+                  except Exception:
+                      pass
+                  await asyncio.sleep(2)
+              print("warning: could not read the model's capabilities from Ollama", flush=True)
+
+
+          async def main():
+              global SESS
+              SESS = ClientSession(timeout=ClientTimeout(total=None, sock_connect=10))
+              await probe()
+              for app, port in ((make_api(), API_PORT), (make_mcp(), MCP_PORT)):
+                  runner = web.AppRunner(app, handler_cancellation=True, access_log=None)
+                  await runner.setup()
+                  await web.TCPSite(runner, "127.0.0.1", port).start()
+              print(f"gateway up: model={MODEL} thinking={'thinking' in CAPS} api=:{API_PORT} mcp=:{MCP_PORT}", flush=True)
+              await asyncio.Event().wait()
+
+
+          if __name__ == "__main__":
+              asyncio.run(main())
+          GATEWAY_PY
+          cat > /tmp/gemma/lib.sh <<'LIB_SH'
+          # Helper functions used by the later steps (sourced: `source /tmp/gemma/lib.sh`).
+          G=/tmp/gemma
+
+          start_ollama() {
+            export OLLAMA_HOST=127.0.0.1:11434 OLLAMA_KEEP_ALIVE=-1 OLLAMA_NUM_PARALLEL=1 \
+                   OLLAMA_MAX_LOADED_MODELS=1 OLLAMA_CONTEXT_LENGTH="${NUM_CTX:-8192}"
+            setsid nohup ollama serve >> "$G/ollama.log" 2>&1 < /dev/null &
+            for _ in $(seq 90); do
+              curl -fs http://127.0.0.1:11434/api/version > /dev/null 2>&1 && return 0
+              sleep 1
+            done
+            echo "::error::Ollama did not start"; tail -n 40 "$G/ollama.log"; return 1
+          }
+
+          start_gateway() {
+            setsid nohup "$G/venv/bin/python" -u "$G/gateway.py" >> "$G/gateway.log" 2>&1 < /dev/null &
+            for _ in $(seq 90); do
+              if curl -fs "http://127.0.0.1:$API_PORT/healthz" > /dev/null 2>&1 \
+                 && curl -fs "http://127.0.0.1:$MCP_PORT/healthz" > /dev/null 2>&1; then
+                return 0
+              fi
+              sleep 1
+            done
+            echo "::error::the gateway did not start"; tail -n 40 "$G/gateway.log"; return 1
+          }
+
+          # start_tunnel api|mcp PORT  ->  writes the public https URL to $G/url_<name>.txt
+          start_tunnel() {
+            local name=$1 port=$2 url="" attempt i
+            for attempt in 1 2 3; do
+              pkill -f "cloudflared.*127.0.0.1:$port" 2> /dev/null || true
+              : > "$G/tunnel_$name.log"
+              setsid nohup "$G/cloudflared" tunnel --no-autoupdate --url "http://127.0.0.1:$port" \
+                > "$G/tunnel_$name.log" 2>&1 < /dev/null &
+              url=""
+              for i in $(seq 60); do
+                url=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$G/tunnel_$name.log" | grep -v '^https://api\.' | head -n 1 || true)
+                [ -n "$url" ] && break
+                pgrep -f "cloudflared.*127.0.0.1:$port" > /dev/null || break  # cloudflared gave up (e.g. rate limited)
+                sleep 1
+              done
+              if [ -n "$url" ]; then
+                for i in $(seq 45); do  # wait until the brand-new public name really answers
+                  if curl -fs -m 8 "$url/healthz" > /dev/null 2>&1; then
+                    echo "$url" > "$G/url_$name.txt"
+                    return 0
+                  fi
+                  sleep 2
+                done
+              fi
+              echo "tunnel '$name': attempt $attempt failed"; tail -n 5 "$G/tunnel_$name.log" || true
+              sleep $((attempt * 10))
+            done
+            echo "::error::could not open the $name tunnel"; return 1
+          }
+
+          print_links() {
+            echo "================================================================"
+            echo " GEMMA IS LIVE   (model: $MODEL)"
+            echo " API  (OpenAI / Anthropic / Ollama) : $(cat "$G/url_api.txt")"
+            echo " MCP  connector URL                 : $(cat "$G/url_mcp.txt")/mcp"
+            echo "================================================================"
+          }
+          LIB_SH
+
+      - name: Install Ollama
+        run: |
+          if ! command -v ollama > /dev/null; then
+            command -v zstd > /dev/null || sudo apt-get install -y -qq zstd
+            if ! curl -fsSL https://ollama.com/download/ollama-linux-amd64.tar.zst | sudo tar --zstd -x -C /usr; then
+              echo "Manual install failed, using the official install script instead"
+              curl -fsSL https://ollama.com/install.sh | sh
+              sudo systemctl stop ollama 2> /dev/null || true   # we start our own server next
+            fi
+          fi
+          ollama --version 2>&1 | grep -i version | head -n 1 || true
+
+      - name: Start Ollama and download the model
+        run: |
+          source /tmp/gemma/lib.sh
+          start_ollama
+          echo "Downloading $MODEL (about 10 GB) ..."
+          touch /tmp/gemma/pulling
+          ( while [ -e /tmp/gemma/pulling ]; do
+              for _ in $(seq 15); do [ -e /tmp/gemma/pulling ] && sleep 1; done
+              [ -e /tmp/gemma/pulling ] && echo "  ... $(du -sh ~/.ollama/models 2> /dev/null | cut -f1) downloaded so far"
+            done ) &
+          for try in 1 2 3; do
+            if curl -fsS http://127.0.0.1:11434/api/pull -d "$(jq -nc --arg m "$MODEL" '{model:$m,stream:false}')" | jq -r '.status // .error'; then
+              break
+            fi
+            echo "download failed (try $try), retrying in 10 s"; sleep 10
+          done
+          rm -f /tmp/gemma/pulling
+          ollama show "$MODEL" | head -n 12
+          df -h / | tail -n 1
+
+      - name: Load the model into RAM and measure speed
+        run: |
+          curl -fsS http://127.0.0.1:11434/api/chat -d "$(jq -nc --arg m "$MODEL" \
+            '{model:$m, stream:false, messages:[{role:"user",content:"Say hello in five words."}], options:{num_predict:48}}')" \
+            | jq -r '"warm-up: \(.eval_count) tokens at \(((.eval_count / (.eval_duration / 1e9)) * 10 | floor) / 10) tokens/s"' \
+            || echo "warm-up skipped"
+          free -m | awk 'NR==2 {print "RAM in use: " $3 " MB of " $2 " MB"}'
+
+      - name: Start the gateway (API + MCP)
+        run: |
+          source /tmp/gemma/lib.sh
+          python3 -m venv /tmp/gemma/venv || { sudo apt-get install -y -qq python3-venv && python3 -m venv /tmp/gemma/venv; }
+          /tmp/gemma/venv/bin/pip install -q "aiohttp>=3.10,<4"
+          start_gateway
+          curl -s "http://127.0.0.1:$API_PORT/healthz"; echo
+
+      - name: Open the two Cloudflare quick tunnels
+        run: |
+          source /tmp/gemma/lib.sh
+          if [ ! -x "$G/cloudflared" ]; then
+            curl -fsSL -o "$G/cloudflared" https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+            chmod +x "$G/cloudflared"
+          fi
+          start_tunnel api "$API_PORT"
+          start_tunnel mcp "$MCP_PORT"
+          print_links
+
+      - name: Publish the links (summary and annotations)
+        run: |
+          source /tmp/gemma/lib.sh
+          api=$(cat "$G/url_api.txt"); mcp=$(cat "$G/url_mcp.txt")
+          until_utc=$(date -u -d "@$(( $(cat "$G/start_epoch") + RUN_MINUTES * 60 ))" '+%H:%M UTC')
+          echo "::notice title=Gemma API (OpenAI / Anthropic / Ollama)::$api"
+          echo "::notice title=Gemma MCP connector URL::$mcp/mcp"
+          cat > "$G/summary.md" <<'MD'
+          ## Gemma is live until about @UNTIL@
+
+          | | Link |
+          |---|---|
+          | **API** (OpenAI, Anthropic, Ollama) | @API@ |
+          | **MCP** connector URL | @MCP@/mcp |
+
+          Open links: no key, no login. They change on every run.
+
+          ### API
+          | Client | Settings |
+          |---|---|
+          | OpenAI SDK / apps | base URL `@API@/v1`, API key: anything |
+          | Anthropic SDK / apps | base URL `@API@`, API key: anything |
+          | Ollama clients | host `@API@` |
+
+          Thinking comes back as `reasoning` + `reasoning_content` (OpenAI), `thinking` blocks (Anthropic) and
+          `message.thinking` (Ollama). Through a quick tunnel, streaming may arrive all at once; non-streaming is safest.
+
+          ### MCP connector (tools: `ask_gemma`, `chat_gemma`, `gemma_info`)
+          - **ChatGPT**: turn on Developer mode (Settings, Apps and Connectors, Advanced), create a connector with the URL above, authentication: none.
+          - **Claude**: Settings, Connectors, Add custom connector, paste the URL above.
+          MD
+          sed -e "s|@API@|$api|g" -e "s|@MCP@|$mcp|g" -e "s|@UNTIL@|$until_utc|g" "$G/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep Gemma online
+        run: |
+          source /tmp/gemma/lib.sh
+          end=$(( $(cat "$G/start_epoch") + RUN_MINUTES * 60 ))
+          next_print=0
+          while [ "$(date +%s)" -lt "$end" ]; do
+            pgrep -f 'ollama serve' > /dev/null || { echo "::warning::Ollama stopped, restarting it"; start_ollama || true; }
+            pgrep -f "$G/gateway.py" > /dev/null || { echo "::warning::the gateway stopped, restarting it"; start_gateway || true; }
+            for t in "api $API_PORT" "mcp $MCP_PORT"; do
+              read -r name port <<< "$t"
+              if ! pgrep -f "cloudflared.*127.0.0.1:$port" > /dev/null; then
+                echo "::warning::the $name tunnel stopped, opening a new one (NEW LINK below)"
+                if start_tunnel "$name" "$port"; then print_links; fi
+              fi
+            done
+            if [ "$(date +%s)" -ge "$next_print" ]; then
+              print_links
+              free -m | awk 'NR==2 {print "RAM in use: " $3 " MB of " $2 " MB"}'
+              echo "$(( (end - $(date +%s)) / 60 )) min left | $(curl -s "http://127.0.0.1:$API_PORT/healthz")"
+              next_print=$(( $(date +%s) + 600 ))
+            fi
+            sleep 15
+          done
+          echo "Session over after ${RUN_MINUTES} min. Run the workflow again for a fresh session (the links will be new)."
